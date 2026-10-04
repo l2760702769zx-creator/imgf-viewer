@@ -60,6 +60,15 @@ public class MifWriter {
         public int chunks;
     }
 
+    /** 融合选项（对应 imgfuse.py 的 --codec/--level/--extreme/--filter/--no-chunk）。 */
+    public static class Options {
+        public int codec = CODEC_LZMA;
+        public int level = 6;          // zlib/bz2: 1-9；lzma preset: 0-6（7+ 手机 OOM）
+        public boolean extreme = false; // 仅 lzma
+        public boolean bestFilter = true; // false = 只用 Paeth（快）
+        public boolean chunked = true;    // false = v1.0 单块（兼容旧版）
+    }
+
     /** 有损格式按魔数识别，存原文不解码。 */
     public static boolean isPassthrough(byte[] d) {
         if (d == null || d.length < 2) return false;
@@ -95,7 +104,7 @@ public class MifWriter {
         }
     }
 
-    public static Result fuse(List<ImageInput> inputs, int codec, OutputStream out,
+    public static Result fuse(List<ImageInput> inputs, Options opts, OutputStream out,
                               Progress progress) throws IOException {
         List<ImageInput> ok = new ArrayList<>();
         for (ImageInput in : inputs) {
@@ -120,7 +129,7 @@ public class MifWriter {
                 } else {
                     w = in.bitmap.getWidth();
                     h = in.bitmap.getHeight();
-                    data = filterBitmap(in.bitmap);
+                    data = filterBitmap(in.bitmap, opts.bestFilter);
                     in.bitmap.recycle();
                     in.bitmap = null;
                     kind = "raw";
@@ -137,7 +146,7 @@ public class MifWriter {
             throw new IOException("滤波失败: " + e.getMessage());
         }
 
-        // ---- 阶段 2：分块组装 ----
+        // ---- 阶段 2：组装（分块或单块） ----
         List<byte[]> cchunks = new ArrayList<>();
         List<Integer> usizes = new ArrayList<>();
         List<String> mentries = new ArrayList<>();
@@ -148,9 +157,10 @@ public class MifWriter {
 
         for (Prepared p : prepared) {
             totalIn += p.originalSize;
-            if ((curBuf.size() + p.data.length > CHUNK_MAX_BYTES
+            if (opts.chunked && (curBuf.size() + p.data.length > CHUNK_MAX_BYTES
                     || curList.size() >= CHUNK_MAX_IMAGES) && !curList.isEmpty()) {
-                sealChunk(curBuf, curList, curOffs, cchunks, usizes, mentries, codec);
+                sealChunk(curBuf, curList, curOffs, cchunks, usizes, mentries,
+                        opts, cchunks.size());
                 curBuf = new ByteArrayOutputStream();
                 curList = new ArrayList<>();
                 curOffs = new ArrayList<>();
@@ -160,7 +170,8 @@ public class MifWriter {
             curBuf.write(p.data);
         }
         if (!curList.isEmpty()) {
-            sealChunk(curBuf, curList, curOffs, cchunks, usizes, mentries, codec);
+            sealChunk(curBuf, curList, curOffs, cchunks, usizes, mentries,
+                    opts, cchunks.size());
         }
 
         // ---- 写文件 ----
@@ -172,15 +183,19 @@ public class MifWriter {
         manifest.append("]");
         byte[] mjson = manifest.toString().getBytes("UTF-8");
 
+        int flags = FLAG_FILTERED;
+        if (opts.chunked) flags |= FLAG_CHUNKED;
         out.write('I'); out.write('M'); out.write('G'); out.write('F');
-        out.write(codec);
-        out.write(FLAG_FILTERED | FLAG_CHUNKED);
+        out.write(opts.codec);
+        out.write(flags);
         writeU32(out, mentries.size());
         writeU32(out, mjson.length);
-        writeU32(out, cchunks.size());
-        for (int i = 0; i < cchunks.size(); i++) {
-            writeU32(out, cchunks.get(i).length);
-            writeU32(out, usizes.get(i));
+        if (opts.chunked) {
+            writeU32(out, cchunks.size());
+            for (int i = 0; i < cchunks.size(); i++) {
+                writeU32(out, cchunks.get(i).length);
+                writeU32(out, usizes.get(i));
+            }
         }
         out.write(mjson);
         long cblobLen = 0;
@@ -195,50 +210,60 @@ public class MifWriter {
         r.skipped = inputs.size() - mentries.size();
         r.inBytes = totalIn;
         r.chunks = cchunks.size();
-        r.outBytes = 18L + cchunks.size() * 8L + mjson.length + cblobLen;
+        r.outBytes = (opts.chunked ? 18L + cchunks.size() * 8L : 14L)
+                + mjson.length + cblobLen;
         return r;
+    }
+
+    /** 兼容旧签名：默认选项。 */
+    public static Result fuse(List<ImageInput> inputs, int codec, OutputStream out,
+                              Progress progress) throws IOException {
+        Options o = new Options();
+        o.codec = codec;
+        return fuse(inputs, o, out, progress);
     }
 
     private static void sealChunk(ByteArrayOutputStream curBuf, List<Prepared> curList,
                                   List<int[]> curOffs, List<byte[]> cchunks,
                                   List<Integer> usizes, List<String> mentries,
-                                  int codec) throws IOException {
+                                  Options opts, int chunkIdx) throws IOException {
         byte[] raw = curBuf.toByteArray();
-        byte[] c = compress(raw, codec);
-        int ci = cchunks.size();
+        byte[] c = compress(raw, opts.codec, opts.level, opts.extreme);
         cchunks.add(c);
         usizes.add(raw.length);
         for (int i = 0; i < curList.size(); i++) {
             Prepared p = curList.get(i);
             int[] os = curOffs.get(i);
-            mentries.add("{\"name\":" + jsonStr(p.name)
-                    + ",\"w\":" + p.w
-                    + ",\"h\":" + p.h
-                    + ",\"kind\":\"" + p.kind + "\""
-                    + ",\"chunk\":" + ci
-                    + ",\"offset\":" + os[0]
-                    + ",\"size\":" + os[1]
-                    + "}");
+            StringBuilder sb = new StringBuilder("{\"name\":").append(jsonStr(p.name))
+                    .append(",\"w\":").append(p.w)
+                    .append(",\"h\":").append(p.h)
+                    .append(",\"kind\":\"").append(p.kind).append("\"");
+            if (opts.chunked) sb.append(",\"chunk\":").append(chunkIdx);
+            sb.append(",\"offset\":").append(os[0])
+                    .append(",\"size\":").append(os[1])
+                    .append("}");
+            mentries.add(sb.toString());
         }
     }
 
     // ---------- 压缩 ----------
 
-    private static byte[] compress(byte[] data, int codec) throws IOException {
+    private static byte[] compress(byte[] data, int codec, int level, boolean extreme)
+            throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         OutputStream cos;
         switch (codec) {
             case CODEC_ZLIB:
-                cos = new DeflaterOutputStream(bos, new Deflater(9));
+                cos = new DeflaterOutputStream(bos, new Deflater(level));
                 break;
             case CODEC_BZ2:
                 cos = new BZip2CompressorOutputStream(bos);
                 break;
             case CODEC_LZMA: {
                 LZMA2Options opts = new LZMA2Options();
-                // 手机堆内存有限：preset 6（8MB 字典，约 80MB 内存）。
-                // preset 9 需要 600MB+，会在 Android 上 OOM（实测）。
-                opts.setPreset(6);
+                // 手机堆内存有限：preset 最高 6（8MB 字典，约 80MB 内存）。
+                // preset 7+ 需要 150MB+，会在 Android 上 OOM（实测）。
+                opts.setPreset(Math.min(6, level));
                 cos = new XZOutputStream(bos, opts);
                 break;
             }
@@ -259,7 +284,7 @@ public class MifWriter {
         return pb <= pc ? b : c;
     }
 
-    private static byte[] filterBitmap(Bitmap bmp) {
+    private static byte[] filterBitmap(Bitmap bmp, boolean bestFilter) {
         int w = bmp.getWidth(), h = bmp.getHeight();
         int[] px = new int[w * h];
         bmp.getPixels(px, 0, w, 0, 0, w, h);
@@ -270,11 +295,11 @@ public class MifWriter {
             rgb[i * 3 + 1] = (byte) (c >> 8);
             rgb[i * 3 + 2] = (byte) c;
         }
-        return filterRows(rgb, w, h);
+        return filterRows(rgb, w, h, bestFilter);
     }
 
-    /** 纯函数：RGB24 → 行滤波后数据（JVM 可单测）。 */
-    public static byte[] filterRows(byte[] rgb, int w, int h) {
+    /** 纯函数：RGB24 → 行滤波后数据（JVM 可单测）。bestFilter=false 时只用 Paeth。 */
+    public static byte[] filterRows(byte[] rgb, int w, int h, boolean bestFilter) {
         int bpp = 3, bpr = w * bpp;
         byte[] out = new byte[h * (1 + bpr)];
         byte[] prev = new byte[bpr];
@@ -285,7 +310,8 @@ public class MifWriter {
             System.arraycopy(rgb, y * bpr, row, 0, bpr);
             int bestF = 0, bestScore = Integer.MAX_VALUE;
             byte[] bestBuf = null;
-            for (int f = 0; f < 5; f++) {
+            // bestFilter=false 时只试 Paeth（快）
+            for (int f = bestFilter ? 0 : 4; f < 5; f++) {
                 int score = 0;
                 for (int i = 0; i < bpr; i++) {
                     int v = row[i] & 0xFF;

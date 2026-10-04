@@ -165,7 +165,7 @@ public class MainActivity extends Activity {
             else toast("未选择图片");
         } else if (requestCode == REQ_CREATE && resultCode == RESULT_OK
                 && data.getData() != null && pendingUris != null) {
-            doFuse(pendingUris, pendingCodec, data.getData());
+            doFuse(pendingUris, data.getData());
             pendingUris = null;
         }
     }
@@ -173,7 +173,7 @@ public class MainActivity extends Activity {
     // ---------- 融合 ----------
 
     private java.util.ArrayList<Uri> pendingUris;
-    private int pendingCodec = MifWriter.CODEC_LZMA;
+    private final MifWriter.Options fuseOpts = new MifWriter.Options();
 
     private void pickImagesForFuse() {
         Intent it = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -184,15 +184,125 @@ public class MainActivity extends Activity {
     }
 
     private void showCodecDialog(java.util.ArrayList<Uri> uris) {
-        final String[] names = {"lzma（最小，推荐）", "bz2", "zlib（最快）"};
-        final int[] codecs = {MifWriter.CODEC_LZMA, MifWriter.CODEC_BZ2, MifWriter.CODEC_ZLIB};
-        final int[] sel = {0};
+        int pad = (int) (16 * getResources().getDisplayMetrics().density);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(pad, pad, pad, pad);
+
+        // --- 编码 ---
+        TextView codecLabel = new TextView(this);
+        codecLabel.setText("压缩编码");
+        codecLabel.setTextSize(14);
+        root.addView(codecLabel);
+        android.widget.RadioGroup codecGroup = new android.widget.RadioGroup(this);
+        codecGroup.setOrientation(LinearLayout.HORIZONTAL);
+        final String[] codecNames = {"lzma", "bz2", "zlib"};
+        final int[] codecVals = {MifWriter.CODEC_LZMA, MifWriter.CODEC_BZ2, MifWriter.CODEC_ZLIB};
+        final android.widget.RadioButton[] codecBtns = new android.widget.RadioButton[3];
+        for (int i = 0; i < 3; i++) {
+            android.widget.RadioButton rb = new android.widget.RadioButton(this);
+            rb.setText(codecNames[i]);
+            rb.setId(100 + i);
+            codecGroup.addView(rb);
+            codecBtns[i] = rb;
+        }
+        codecBtns[0].setChecked(true);
+        root.addView(codecGroup);
+
+        // --- 等级步进器 ---
+        LinearLayout lvlRow = new LinearLayout(this);
+        lvlRow.setOrientation(LinearLayout.HORIZONTAL);
+        lvlRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView lvlLabel = new TextView(this);
+        lvlLabel.setText("压缩等级  ");
+        lvlLabel.setTextSize(14);
+        lvlRow.addView(lvlLabel);
+        Button minusBtn = new Button(this);
+        minusBtn.setText("－");
+        lvlRow.addView(minusBtn);
+        final TextView lvlVal = new TextView(this);
+        lvlVal.setTextSize(16);
+        lvlVal.setPadding(pad / 2, 0, pad / 2, 0);
+        lvlVal.setMinWidth((int) (48 * getResources().getDisplayMetrics().density));
+        lvlVal.setGravity(Gravity.CENTER);
+        lvlRow.addView(lvlVal);
+        Button plusBtn = new Button(this);
+        plusBtn.setText("＋");
+        lvlRow.addView(plusBtn);
+        final TextView lvlHint = new TextView(this);
+        lvlHint.setTextSize(12);
+        lvlHint.setTextColor(Color.GRAY);
+        lvlHint.setPadding(pad / 2, 0, 0, 0);
+        lvlRow.addView(lvlHint);
+        root.addView(lvlRow);
+
+        // --- extreme / 滤波 / 分块 ---
+        final android.widget.CheckBox extremeBox = new android.widget.CheckBox(this);
+        extremeBox.setText("lzma extreme（更慢，压得更小）");
+        root.addView(extremeBox);
+
+        TextView filtLabel = new TextView(this);
+        filtLabel.setText("行滤波");
+        filtLabel.setTextSize(14);
+        root.addView(filtLabel);
+        android.widget.RadioGroup filtGroup = new android.widget.RadioGroup(this);
+        filtGroup.setOrientation(LinearLayout.HORIZONTAL);
+        android.widget.RadioButton bestRb = new android.widget.RadioButton(this);
+        bestRb.setText("最优（慢而小）");
+        bestRb.setId(200);
+        android.widget.RadioButton fastRb = new android.widget.RadioButton(this);
+        fastRb.setText("快速（只用 Paeth）");
+        fastRb.setId(201);
+        filtGroup.addView(bestRb);
+        filtGroup.addView(fastRb);
+        bestRb.setChecked(true);
+        root.addView(filtGroup);
+
+        final android.widget.CheckBox chunkBox = new android.widget.CheckBox(this);
+        chunkBox.setText("分块 v1.1（大包随点随看，推荐）");
+        chunkBox.setChecked(true);
+        root.addView(chunkBox);
+
+        // --- 联动：编码切换时更新等级范围与 extreme 可用性 ---
+        final int[] lvl = {6};
+        final int[] lvlMin = {0};
+        final int[] lvlMax = {6};
+        Runnable refreshLvl = () -> {
+            lvlVal.setText(String.valueOf(lvl[0]));
+            lvlHint.setText(codecVals[codecGroup.getCheckedRadioButtonId() - 100]
+                    == MifWriter.CODEC_LZMA ? "preset 0-6" : "level 1-9");
+        };
+        codecGroup.setOnCheckedChangeListener((g, id) -> {
+            int c = codecVals[id - 100];
+            if (c == MifWriter.CODEC_LZMA) {
+                lvlMin[0] = 0; lvlMax[0] = 6;
+                extremeBox.setEnabled(true);
+            } else {
+                lvlMin[0] = 1; lvlMax[0] = 9;
+                extremeBox.setEnabled(false);
+                extremeBox.setChecked(false);
+            }
+            lvl[0] = Math.max(lvlMin[0], Math.min(lvlMax[0], lvl[0] == 0 && c != MifWriter.CODEC_LZMA ? 6 : lvl[0]));
+            refreshLvl.run();
+        });
+        minusBtn.setOnClickListener(v -> {
+            if (lvl[0] > lvlMin[0]) { lvl[0]--; refreshLvl.run(); }
+        });
+        plusBtn.setOnClickListener(v -> {
+            if (lvl[0] < lvlMax[0]) { lvl[0]++; refreshLvl.run(); }
+        });
+        refreshLvl.run();
+
         new android.app.AlertDialog.Builder(this)
-                .setTitle("选择 " + uris.size() + " 张图的压缩编码")
-                .setSingleChoiceItems(names, 0, (d, which) -> sel[0] = which)
+                .setTitle("融合 " + uris.size() + " 张图")
+                .setView(root)
                 .setPositiveButton("开始融合", (d, which) -> {
                     pendingUris = uris;
-                    pendingCodec = codecs[sel[0]];
+                    fuseOpts.codec = codecVals[codecGroup.getCheckedRadioButtonId() - 100];
+                    fuseOpts.level = lvl[0];
+                    fuseOpts.extreme = extremeBox.isChecked();
+                    fuseOpts.bestFilter = filtGroup.getCheckedRadioButtonId() == 200;
+                    fuseOpts.chunked = chunkBox.isChecked();
                     Intent it = new Intent(Intent.ACTION_CREATE_DOCUMENT);
                     it.addCategory(Intent.CATEGORY_OPENABLE);
                     it.setType("application/octet-stream");
@@ -203,10 +313,20 @@ public class MainActivity extends Activity {
                 .show();
     }
 
-    private void doFuse(java.util.ArrayList<Uri> uris, int codec, Uri saveUri) {
+    private void doFuse(java.util.ArrayList<Uri> uris, Uri saveUri) {
         infoView.setText("正在读取图片…");
+        final MifWriter.Options opts = new MifWriter.Options();
+        opts.codec = fuseOpts.codec;
+        opts.level = fuseOpts.level;
+        opts.extreme = fuseOpts.extreme;
+        opts.bestFilter = fuseOpts.bestFilter;
+        opts.chunked = fuseOpts.chunked;
         Logger.d("FUSE", "开始融合: " + uris.size() + " 个输入, 编码="
-                + MifWriter.CODEC_NAMES[codec] + ", 输出=" + saveUri);
+                + MifWriter.CODEC_NAMES[opts.codec] + " lv=" + opts.level
+                + (opts.extreme ? " extreme" : "")
+                + (opts.bestFilter ? "" : " fast滤波")
+                + (opts.chunked ? "" : " v1.0单块")
+                + ", 输出=" + saveUri);
         new Thread(() -> {
             try {
                 java.util.ArrayList<MifWriter.ImageInput> inputs = new java.util.ArrayList<>();
@@ -247,7 +367,7 @@ public class MainActivity extends Activity {
                 Logger.d("FUSE", "开始压缩…");
                 try (java.io.OutputStream out = getContentResolver().openOutputStream(saveUri)) {
                     if (out == null) throw new java.io.IOException("无法写入目标文件");
-                    MifWriter.Result r = MifWriter.fuse(inputs, codec, out, prog);
+                    MifWriter.Result r = MifWriter.fuse(inputs, opts, out, prog);
                     Logger.d("FUSE", "完成: " + r.fused + " 张, "
                             + human(r.inBytes) + " -> " + human(r.outBytes));
                     final String msg = "融合完成：" + r.fused + " 张，"
