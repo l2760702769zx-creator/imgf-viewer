@@ -8,7 +8,6 @@
 
 An Android app that **losslessly fuses multiple images into a single `.imgf` file** — and splits them back whenever you want to view them. Trade CPU time for storage space.
 
-![icon](screenshots/icon-preview.png)
 
 ## Why?
 

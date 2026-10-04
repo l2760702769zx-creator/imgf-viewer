@@ -8,7 +8,6 @@
 
 一个安卓 App，把**多张图片无损融合成单个 `.imgf` 文件**，想看时再拆回来。用 CPU 时间换存储空间。
 
-![icon](screenshots/icon-preview.png)
 
 ## 为什么做这个？
 
