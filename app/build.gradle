@@ -1,0 +1,36 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.mtr.mifviewer'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.mtr.mifviewer'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // lzma 解码（.mif 默认编码）
+    implementation 'org.tukaani:xz:1.9'
+    // bzip2 解码（.mif 可选编码）
+    implementation 'org.apache.commons:commons-compress:1.26.0'
+}

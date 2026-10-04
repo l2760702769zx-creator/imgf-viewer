@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 眼白 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,54 C28,34 80,34 96,54 C80,74 28,74 12,54 Z" />
+
+    <!-- 虹膜：三层错叠的“照片”，clip 到圆形 -->
+    <group>
+        <clip-path android:pathData="M33,55 A21,21 0 1,0 75,55 A21,21 0 1,0 33,55 Z" />
+        <path
+            android:fillColor="#FF6B9D"
+            android:pathData="M51,50 H71 Q76,50 76,55 V69 Q76,74 71,74 H51 Q46,74 46,69 V55 Q46,50 51,50 Z" />
+        <path
+            android:fillColor="#6C5CE7"
+            android:pathData="M44,43 H64 Q69,43 69,48 V62 Q69,67 64,67 H44 Q39,67 39,62 V48 Q39,43 44,43 Z" />
+        <path
+            android:fillColor="#00D2FF"
+            android:pathData="M37,36 H57 Q62,36 62,41 V55 Q62,60 57,60 H37 Q32,60 32,55 V41 Q32,36 37,36 Z" />
+    </group>
+
+    <!-- 瞳孔 + 高光 -->
+    <path
+        android:fillColor="#12132B"
+        android:pathData="M47,55 A7,7 0 1,0 61,55 A7,7 0 1,0 47,55 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M48.5,52 A2.5,2.5 0 1,0 53.5,52 A2.5,2.5 0 1,0 48.5,52 Z" />
+
+</vector>

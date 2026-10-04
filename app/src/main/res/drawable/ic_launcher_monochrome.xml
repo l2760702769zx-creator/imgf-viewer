@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 主题图标（单色）：眼睛剪影 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,54 C28,34 80,34 96,54 C80,74 28,74 12,54 Z" />
+    <group>
+        <clip-path android:pathData="M33,55 A21,21 0 1,0 75,55 A21,21 0 1,0 33,55 Z" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M37,36 H57 Q62,36 62,41 V55 Q62,60 57,60 H37 Q32,60 32,55 V41 Q32,36 37,36 Z" />
+    </group>
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.55"
+        android:pathData="M47,55 A7,7 0 1,0 61,55 A7,7 0 1,0 47,55 Z" />
+</vector>
