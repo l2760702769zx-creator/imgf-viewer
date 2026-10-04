@@ -11,5 +11,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "MifViewer"
+rootProject.name = "ImgfViewer"
 include(":app")
