@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-imgfuse.py —— 图片无损融合 / 分割
+imgfuse.py -- 图片无损融合 / 分割（.imgf v1.1）
 
 把 N 张图片融合成单个 .imgf 文件，需要看时再无损拆回。
 设计目标：用 CPU 时间换存储空间（性能换空间）。
@@ -8,39 +8,42 @@ imgfuse.py —— 图片无损融合 / 分割
 原理
 ----
 * PNG / BMP / GIF：解码成原始 RGB24，按行做 PNG 滤波（每行从
-  None/Sub/Up/Average/Paeth 里选最优），全部拼进一个数据块，
-  再用 lzma / bz2 / zlib 整体压缩。跨图的字典匹配对连拍、
-  截图序列这类相似图片特别有效。
-* JPEG：本身是有损压缩，解码再无损存只会更大，所以直接存原文件
-  字节（不碰它，保证 1 字节不差）。
+  None/Sub/Up/Average/Paeth 里选最优），按块（chunk）拼起来，
+  每块独立用 lzma / bz2 / zlib 压缩。跨图的字典匹配对连拍、
+  截图序列这类相似图片特别有效；分块后查看任意一张图只需解压
+  其所在的块，不用全量解压。
+* JPEG / WebP / HEIC / AVIF：本身是有损压缩，解码再无损存只会
+  更大，所以直接存原文件字节（不碰它，保证 1 字节不差）。
+  按魔数识别，不看扩展名。
 
-文件格式 .imgf
--------------
+文件格式 .imgf v1.1
+------------------
   magic 4B  "IMGF"（旧文件 "MIF1" 仍可读取）
   codec 1B  0=zlib 1=bz2 2=lzma
-  flags 1B  bit0=1 表示 raw 数据经过行滤波
+  flags 1B  bit0=1 行滤波已应用；bit1=1 分块
   n     4B  图片数量
   mlen  4B  manifest JSON 长度
-  manifest  JSON: [{name,w,h,kind,offset,size}...]
+  [分块时] cnum 4B，之后每块 8B（csize 4B + usize 4B）
+  manifest  JSON: [{name,w,h,kind,chunk,offset,size}...]
             kind "raw" = 滤波后 RGB24, kind "file" = 原文件字节
-            offset/size 指解压后数据块中的位置
-  blob  剩余全部 = 压缩后的数据块
+            chunk = 所在块索引；offset/size 指解压后该块内的位置
+  blob  各压缩块拼接（不分块时为单个压缩流）
 
-零依赖单文件（只用标准库，自带纯 Python PNG/JPEG/BMP/GIF 解码器与 PNG 编码器）。
+零依赖单文件（只用标准库，自带纯 Python PNG/BMP/GIF 解码器与 PNG 编码器）。
 
 用法
 ----
   融合:  python3 imgfuse.py fuse a.png b.jpg c.bmp -o pack.imgf
          python3 imgfuse.py fuse *.png -o pack.imgf --codec lzma -p 9 -e
+         python3 imgfuse.py fuse a.png b.jpg -o pack.imgf --no-chunk  # v1.0 兼容
   批量:  python3 imgfuse.py fuse ./photos/ -o out/
-         # photos/ 的每个子目录各融成一个 .imgf，photos/ 自身的图片另融成 photos.imgf
   拆分:  python3 imgfuse.py split pack.imgf -o out/
   查看:  python3 imgfuse.py info pack.imgf
 """
 
 import argparse
 import bz2
-import io
+import concurrent.futures
 import json
 import lzma
 import os
@@ -54,6 +57,12 @@ MAGIC_OLD = b"MIF1"  # 兼容 2026-10-04 前生成的旧文件
 CODECS = {"zlib": 0, "bz2": 1, "lzma": 2}
 CODEC_NAMES = {v: k for k, v in CODECS.items()}
 
+FLAG_FILTERED = 1
+FLAG_CHUNKED = 2
+
+CHUNK_MAX_BYTES = 8 * 1024 * 1024   # 每块解压后上限
+CHUNK_MAX_IMAGES = 64               # 每块图片数上限
+
 
 class _ImgError(Exception):
     pass
@@ -61,6 +70,29 @@ class _ImgError(Exception):
 
 class _Unsupported(_ImgError):
     pass
+
+
+# ---------- 魔数识别 ----------
+
+def _is_jpeg(d):
+    return d[:2] == b"\xff\xd8"
+
+
+def _is_webp(d):
+    return d[:4] == b"RIFF" and d[8:12] == b"WEBP"
+
+
+def _is_heif(d):
+    if d[4:8] != b"ftyp":
+        return False
+    brand = d[8:12]
+    return brand in (b"heic", b"heix", b"hevc", b"heim", b"heis",
+                     b"mif1", b"msf1", b"avif", b"avis")
+
+
+def should_passthrough(data):
+    """有损格式存原文，不解码。按魔数判断。"""
+    return _is_jpeg(data) or _is_webp(data) or _is_heif(data)
 
 
 def _png_unfilter(raw, h, bpr, xbytes):
@@ -186,9 +218,6 @@ def _decode_png(data, rgb=False):
     return w, h, gray, w, h, 1
 
 
-# ---------- BMP ----------
-
-
 def _decode_bmp(data, rgb=False):
     off = int.from_bytes(data[10:14], "little")
     w = int.from_bytes(data[18:22], "little", signed=True)
@@ -219,9 +248,6 @@ def _decode_bmp(data, rgb=False):
             b, g, r = data[o], data[o + 1], data[o + 2]
             gray[row * w + x] = (77 * r + 150 * g + 29 * b) >> 8
     return w, h, gray, w, h, 1
-
-
-# ---------- GIF（第一帧） ----------
 
 
 def _lzw_decode(comp, min_code, expect):
@@ -345,15 +371,12 @@ def _decode_gif(data, rgb=False):
     raise _ImgError("no image in gif")
 
 
-# ---------- 统一入口 ----------
-
-
 def load_rgb(path):
-    """返回 (w, h, RGB24 bytes)。JPEG 不支持（调用方应存原文件字节）。"""
+    """返回 (w, h, RGB24 bytes)。有损格式不支持（调用方应存原文件字节）。"""
     with open(path, "rb") as f:
         data = f.read()
-    if data[:2] == b"\xff\xd8":
-        raise _Unsupported("jpeg has no lossless rgb path; store file bytes")
+    if should_passthrough(data):
+        raise _Unsupported("lossy format has no rgb path; store file bytes")
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         w, h, px, _, _, _ = _decode_png(data, rgb=True)
         return w, h, px
@@ -374,13 +397,6 @@ def human(n):
     return f"{n:.1f}TB"
 
 
-# ---------- PNG 编码器（纯 Python，用于 split 输出） ----------
-
-def _chunk(typ, data):
-    c = typ + data
-    return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c))
-
-
 def _paeth(a, b, c):
     p = a + b - c
     pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
@@ -394,18 +410,18 @@ def _filter_row(ftype, row, prev, bpp):
     out = bytearray(n)
     if ftype == 0:
         out[:] = row
-    elif ftype == 1:  # Sub
+    elif ftype == 1:
         for i in range(n):
             a = row[i - bpp] if i >= bpp else 0
             out[i] = (row[i] - a) & 0xFF
-    elif ftype == 2:  # Up
+    elif ftype == 2:
         for i in range(n):
             out[i] = (row[i] - prev[i]) & 0xFF
-    elif ftype == 3:  # Average
+    elif ftype == 3:
         for i in range(n):
             a = row[i - bpp] if i >= bpp else 0
             out[i] = (row[i] - ((a + prev[i]) >> 1)) & 0xFF
-    else:  # Paeth
+    else:
         for i in range(n):
             a = row[i - bpp] if i >= bpp else 0
             b = prev[i]
@@ -427,6 +443,29 @@ def _filter_best(row, prev, bpp):
     return best
 
 
+def _filter_image(args):
+    """进程池任务：(w, h, rgb, filt) -> 滤波后字节。顶层函数以便 pickle。"""
+    w, h, rgb, filt = args
+    bpp = 3
+    fb = bytearray()
+    prev = bytearray(w * bpp)
+    for y in range(h):
+        row = rgb[y * w * bpp:(y + 1) * w * bpp]
+        if filt == "best":
+            f, fr = _filter_best(row, prev, bpp)
+        else:
+            f, fr = 4, _filter_row(4, row, prev, bpp)
+        fb.append(f)
+        fb += fr
+        prev = bytearray(row)
+    return bytes(fb)
+
+
+def _png_chunk(typ, data):
+    c = typ + data
+    return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c))
+
+
 def encode_png(w, h, rgb, filt="best"):
     """rgb: w*h*3 bytes。返回完整 PNG 文件字节。"""
     bpp = 3
@@ -442,9 +481,9 @@ def encode_png(w, h, rgb, filt="best"):
         raw += fr
         prev = bytearray(row)
     ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
-            + _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-            + _chunk(b"IEND", b""))
+    return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
+            + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + _png_chunk(b"IEND", b""))
 
 
 def _unfilter_rows(blob, w, h):
@@ -505,11 +544,6 @@ def _decompress(data, codec):
 
 # ---------- fuse ----------
 
-def _is_jpeg(path):
-    with open(path, "rb") as f:
-        return f.read(2) == b"\xff\xd8"
-
-
 def _collect_images(inputs):
     """输入路径展开成文件列表（目录只取直接子文件，不递归）。"""
     files = []
@@ -537,54 +571,60 @@ def _check_args(a):
         sys.exit(1)
 
 
+def _seal_chunk(cur, cur_entries, codec, level, extreme, manifest, chunk_idx):
+    """压缩一块，manifest 条目填 chunk/offset/size。返回 (cblob, usize)。"""
+    print(f"[分块] 块 {chunk_idx}: {len(cur_entries)} 张图，"
+          f"{human(len(cur))}，压缩中…")
+    cblob = _compress(bytes(cur), codec, level, extreme)
+    off = 0
+    for md, payload in cur_entries:
+        md.update({"chunk": chunk_idx, "offset": off, "size": len(payload)})
+        manifest.append(md)
+        off += len(payload)
+    return cblob, len(cur)
+
+
 def _fuse_files(files, output, a, fatal=True):
     """把 files 融合成单个 output .imgf。返回 True/False。"""
     codec = CODECS[a.codec]
     level = a.level
-    blob = bytearray()
-    manifest = []
-    total_in = 0
+    chunked = not a.no_chunk
     filt = a.filter
+    jobs = a.jobs if a.jobs > 0 else (os.cpu_count() or 2)
 
+    # ---- 阶段 1：分类（直存 / 需滤波），读文件 ----
+    pending = []   # (idx, name, kind, w, h, payload)
+    total_in = 0
     for idx, p in enumerate(files):
         if not os.path.isfile(p):
             print(f"[{idx + 1}/{len(files)}] {p}: 不存在，跳过")
             continue
         name = os.path.basename(p)
-        total_in += os.path.getsize(p)
-        if _is_jpeg(p):
-            with open(p, "rb") as f:
-                fb = f.read()
-            manifest.append({"name": name, "w": 0, "h": 0, "kind": "file",
-                             "offset": len(blob), "size": len(fb)})
-            blob += fb
-            print(f"[{idx + 1}/{len(files)}] {name}: JPEG 存原文 {human(len(fb))}")
+        with open(p, "rb") as f:
+            data = f.read()
+        total_in += len(data)
+        if should_passthrough(data):
+            fmt = ("JPEG" if _is_jpeg(data)
+                   else "WebP" if _is_webp(data) else "HEIC/AVIF")
+            pending.append((idx, name, "file", 0, 0, data))
+            print(f"[{idx + 1}/{len(files)}] {name}: {fmt} 存原文 {human(len(data))}")
             continue
         try:
-            w, h, rgb = load_rgb(p)
+            if data[:8] == b"\x89PNG\r\n\x1a\n":
+                w, h, px, _, _, _ = _decode_png(data, rgb=True)
+            elif data[:2] == b"BM":
+                w, h, px, _, _, _ = _decode_bmp(data, rgb=True)
+            elif data[:6] in (b"GIF89a", b"GIF87a"):
+                w, h, px, _, _, _ = _decode_gif(data, rgb=True)
+            else:
+                print(f"[{idx + 1}/{len(files)}] {name}: 跳过（未知格式）")
+                continue
         except (_Unsupported, _ImgError) as e:
             print(f"[{idx + 1}/{len(files)}] {name}: 跳过（{e}）")
             continue
-        # 行滤波
-        bpp = 3
-        fb = bytearray()
-        prev = bytearray(w * bpp)
-        for y in range(h):
-            row = rgb[y * w * bpp:(y + 1) * w * bpp]
-            if filt == "best":
-                f, fr = _filter_best(row, prev, bpp)
-            else:
-                f, fr = 4, _filter_row(4, row, prev, bpp)
-            fb.append(f)
-            fb += fr
-            prev = bytearray(row)
-        manifest.append({"name": name, "w": w, "h": h, "kind": "raw",
-                         "offset": len(blob), "size": len(fb)})
-        blob += fb
-        print(f"[{idx + 1}/{len(files)}] {name}: {w}x{h} RGB "
-              f"{human(w * h * 3)} -> 滤波后 {human(len(fb))}")
+        pending.append((idx, name, "raw", w, h, px))
 
-    if not manifest:
+    if not pending:
         msg = "没有可用图片"
         if fatal:
             print(msg, file=sys.stderr)
@@ -592,18 +632,74 @@ def _fuse_files(files, output, a, fatal=True):
         print(f"{output}: {msg}，已跳过")
         return False
 
-    print(f"压缩中（{a.codec} level={level}"
-          f"{' extreme' if a.extreme and a.codec == 'lzma' else ''}）...")
-    cblob = _compress(bytes(blob), codec, level, a.extreme)
-    flags = 1  # 行滤波已应用
+    # ---- 阶段 2：行滤波（多进程并行；纯 Python 循环在 GIL 下线程无加速） ----
+    to_filter = [(i, name, w, h, px)
+                 for (i, name, kind, w, h, px) in pending if kind == "raw"]
+    filtered = {}
+    if to_filter:
+        if len(to_filter) == 1 or jobs == 1:
+            for (i, name, w, h, px) in to_filter:
+                filtered[i] = _filter_image((w, h, px, filt))
+                print(f"[滤波] {name}: {w}x{h} -> {human(len(filtered[i]))}")
+        else:
+            nw = min(jobs, len(to_filter))
+            print(f"[滤波] {len(to_filter)} 张图，{nw} 进程并行…")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=nw) as ex:
+                futs = {ex.submit(_filter_image, (w, h, px, filt)): (i, name, w, h)
+                        for (i, name, w, h, px) in to_filter}
+                for fut in concurrent.futures.as_completed(futs):
+                    i, name, w, h = futs[fut]
+                    filtered[i] = fut.result()
+                    print(f"[滤波] {name}: {w}x{h} -> {human(len(filtered[i]))}")
 
+    # ---- 阶段 3：组装分块 ----
+    entries = []  # (manifest_dict, payload_bytes)
+    for (idx, name, kind, w, h, px) in pending:
+        payload = px if kind == "file" else filtered[idx]
+        entries.append(({"name": name, "w": w, "h": h, "kind": kind}, payload))
+
+    chunks = []  # (compressed_bytes, usize)
+    manifest = []
+    if chunked:
+        cur = bytearray()
+        cur_entries = []
+        for md, payload in entries:
+            if (len(cur) + len(payload) > CHUNK_MAX_BYTES
+                    or len(cur_entries) >= CHUNK_MAX_IMAGES) and cur_entries:
+                chunks.append(_seal_chunk(cur, cur_entries, codec, level,
+                                          a.extreme, manifest, len(chunks)))
+                cur = bytearray()
+                cur_entries = []
+            cur_entries.append((md, payload))
+            cur += payload
+        if cur_entries:
+            chunks.append(_seal_chunk(cur, cur_entries, codec, level,
+                                      a.extreme, manifest, len(chunks)))
+        flags = FLAG_FILTERED | FLAG_CHUNKED
+    else:
+        blob = bytearray()
+        for md, payload in entries:
+            md.update({"chunk": 0, "offset": len(blob), "size": len(payload)})
+            manifest.append(md)
+            blob += payload
+        print(f"压缩中（{a.codec} level={level}"
+              f"{' extreme' if a.extreme and a.codec == 'lzma' else ''}）...")
+        cblob = _compress(bytes(blob), codec, level, a.extreme)
+        chunks = [(cblob, len(blob))]
+        flags = FLAG_FILTERED
+
+    # ---- 写文件 ----
     mjson = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
-    hdr = (MAGIC + bytes([codec, flags]) + struct.pack(">II", len(manifest), len(mjson)))
+    hdr = MAGIC + bytes([codec, flags]) + struct.pack(">II", len(manifest), len(mjson))
+    if chunked:
+        hdr += struct.pack(">I", len(chunks))
+        for cblob, usize in chunks:
+            hdr += struct.pack(">II", len(cblob), usize)
     with open(output, "wb") as f:
-        f.write(hdr + mjson + cblob)
+        f.write(hdr + mjson + b"".join(c for c, _ in chunks))
 
-    out_size = 14 + len(mjson) + len(cblob)
-    print(f"完成：{len(manifest)} 张图，原文共 {human(total_in)}，"
+    out_size = os.path.getsize(output)
+    print(f"完成：{len(manifest)} 张图，{len(chunks)} 块，原文共 {human(total_in)}，"
           f"融合后 {human(out_size)}（{out_size / total_in * 100:.1f}%）")
     print(f"输出：{output}")
     return True
@@ -613,9 +709,8 @@ def cmd_fuse(a):
     _check_args(a)
     out = a.output
     if out.endswith(os.sep) or os.path.isdir(out):
-        # ---- 批量模式：输入文件夹的每个子目录各融成一个 .imgf ----
         os.makedirs(out, exist_ok=True)
-        groups = []  # (组名, [文件])
+        groups = []
         for p in a.inputs:
             if os.path.isdir(p):
                 ap = os.path.abspath(p)
@@ -661,65 +756,116 @@ def cmd_fuse(a):
         _fuse_files(files, out, a)
 
 
-# ---------- split ----------
+# ---------- 读取（分块懒解压） ----------
+
+class Bundle:
+    """懒解压读取：只解压需要的块并缓存。"""
+
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            self._data = f.read()
+        data = self._data
+        if data[:4] not in (MAGIC, MAGIC_OLD):
+            raise _ImgError("not a .imgf file")
+        self.codec = data[4]
+        self.flags = data[5]
+        n, mlen = struct.unpack(">II", data[6:14])
+        pos = 14
+        self.chunked = bool(self.flags & FLAG_CHUNKED)
+        self.chunks = None
+        if self.chunked:
+            if data[:4] == MAGIC_OLD:
+                raise _ImgError("chunked bit on legacy file")
+            cnum = struct.unpack(">I", data[pos:pos + 4])[0]
+            pos += 4
+            self.chunks = []
+            coff = 0
+            for _ in range(cnum):
+                csize, usize = struct.unpack(">II", data[pos:pos + 8])
+                pos += 8
+                self.chunks.append((coff, csize, usize))
+                coff += csize
+        self.manifest = json.loads(data[pos:pos + mlen].decode("utf-8"))
+        self._blob_off = pos + mlen
+        self._cache = {}
+
+    def _chunk_data(self, idx):
+        if idx in self._cache:
+            return self._cache[idx]
+        if not self.chunked:
+            raw = _decompress(self._data[self._blob_off:], self.codec)
+        else:
+            coff, csize, usize = self.chunks[idx]
+            seg = self._data[self._blob_off + coff:self._blob_off + coff + csize]
+            raw = _decompress(seg, self.codec)
+        self._cache[idx] = raw
+        while len(self._cache) > 2:
+            self._cache.pop(next(iter(self._cache)))
+        return raw
+
+    def entry_data(self, m):
+        ci = m.get("chunk", 0)
+        raw = self._chunk_data(ci)
+        return raw[m["offset"]:m["offset"] + m["size"]]
+
+    def raw_size(self):
+        if not self.chunked:
+            try:
+                return len(_decompress(self._data[self._blob_off:], self.codec))
+            except Exception:
+                return -1
+        return sum(u for _, _, u in self.chunks)
+
 
 def _read_bundle(path):
-    with open(path, "rb") as f:
-        data = f.read()
-    if data[:4] not in (MAGIC, MAGIC_OLD):
-        raise _ImgError("not a .imgf file")
-    codec = data[4]
-    flags = data[5]
-    n, mlen = struct.unpack(">II", data[6:14])
-    manifest = json.loads(data[14:14 + mlen].decode("utf-8"))
-    cblob = data[14 + mlen:]
-    blob = _decompress(cblob, codec)
-    return manifest, blob, flags
+    """兼容旧接口：返回 (manifest, blob, flags)。大文件慎用（全量解压）。"""
+    b = Bundle(path)
+    if b.chunked:
+        blob = bytearray()
+        for i in range(len(b.chunks)):
+            blob += b._chunk_data(i)
+        return b.manifest, bytes(blob), b.flags
+    return b.manifest, b._chunk_data(0), b.flags
 
 
 def cmd_split(a):
-    manifest, blob, flags = _read_bundle(a.bundle)
+    b = Bundle(a.bundle)
     os.makedirs(a.output, exist_ok=True)
-    for m in manifest:
-        seg = blob[m["offset"]:m["offset"] + m["size"]]
-        if m["kind"] == "file":
-            # JPEG 原文：扩展名保持原样
-            out = os.path.join(a.output, m["name"])
-            with open(out, "wb") as f:
-                f.write(seg)
-        else:
-            rgb = _unfilter_rows(seg, m["w"], m["h"])
-            base = os.path.splitext(m["name"])[0] + ".png"
-            out = os.path.join(a.output, base)
-            with open(out, "wb") as f:
-                f.write(encode_png(m["w"], m["h"], rgb))
-        print(f"  {m['name']} -> {out} ({human(len(seg))})")
-    print(f"拆分完成：{len(manifest)} 张 -> {a.output}/")
+    by_chunk = {}
+    for mi, m in enumerate(b.manifest):
+        by_chunk.setdefault(m.get("chunk", 0), []).append((mi, m))
+    for ci in sorted(by_chunk):
+        raw = b._chunk_data(ci)
+        for _, m in by_chunk[ci]:
+            seg = raw[m["offset"]:m["offset"] + m["size"]]
+            if m["kind"] == "file":
+                out = os.path.join(a.output, m["name"])
+                with open(out, "wb") as f:
+                    f.write(seg)
+            else:
+                rgb = _unfilter_rows(seg, m["w"], m["h"])
+                base = os.path.splitext(m["name"])[0] + ".png"
+                out = os.path.join(a.output, base)
+                with open(out, "wb") as f:
+                    f.write(encode_png(m["w"], m["h"], rgb))
+            print(f"  {m['name']} -> {out} ({human(len(seg))})")
+    print(f"拆分完成：{len(b.manifest)} 张 -> {a.output}/")
 
 
 def cmd_info(a):
-    with open(a.bundle, "rb") as f:
-        data = f.read()
-    if data[:4] not in (MAGIC, MAGIC_OLD):
-        print("不是 .imgf 文件", file=sys.stderr)
-        sys.exit(1)
-    codec = CODEC_NAMES[data[4]]
-    n, mlen = struct.unpack(">II", data[6:14])
-    manifest = json.loads(data[14:14 + mlen].decode("utf-8"))
-    cblob = data[14 + mlen:]
-    blob = _decompress(data[4], cblob) if False else None
-    # 解压只为统计解压后大小
-    try:
-        raw_size = len(_decompress(cblob, data[4]))
-    except Exception:
-        raw_size = -1
+    b = Bundle(a.bundle)
+    data = b._data
+    codec = CODEC_NAMES[b.codec]
+    raw_size = b.raw_size()
     print(f"文件：{a.bundle}（{human(len(data))}）")
-    print(f"编码：{codec}，图片数：{n}")
+    print(f"编码：{codec}，图片数：{len(b.manifest)}"
+          f"{'，分块：' + str(len(b.chunks)) + ' 块' if b.chunked else '（v1.0 单块）'}")
     if raw_size >= 0:
-        print(f"压缩前数据块：{human(raw_size)}，压缩后：{human(len(cblob))}，"
-              f"比 {len(cblob) / raw_size * 100:.1f}%")
+        csize = len(data) - b._blob_off
+        print(f"压缩前数据块：{human(raw_size)}，压缩后：{human(csize)}，"
+              f"比 {csize / raw_size * 100:.1f}%")
     print(f"{'文件名':<28} {'尺寸':<12} {'类型':<6} {'数据'}")
-    for m in manifest:
+    for m in b.manifest:
         dim = f"{m['w']}x{m['h']}" if m["kind"] == "raw" else "-"
         print(f"{m['name']:<28} {dim:<12} {m['kind']:<6} {human(m['size'])}")
 
@@ -740,6 +886,10 @@ def main():
                    help="lzma extreme 模式（更慢，压得更小）")
     f.add_argument("--filter", choices=["best", "paeth"], default="best",
                    help="行滤波策略：best 逐行试 5 种（慢但小），paeth 只用 Paeth（快）")
+    f.add_argument("--no-chunk", action="store_true",
+                   help="不分块（v1.0 单压缩流，兼容旧版 App）")
+    f.add_argument("--jobs", "-j", type=int, default=0,
+                   help="滤波并行进程数（默认 CPU 数，最多按图数；1=串行）")
 
     s = sub.add_parser("split", help="把 .imgf 拆回图片")
     s.add_argument("bundle", help=".imgf 文件")

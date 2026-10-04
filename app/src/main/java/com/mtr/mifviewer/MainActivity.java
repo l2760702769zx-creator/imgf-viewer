@@ -30,7 +30,7 @@ public class MainActivity extends Activity {
     private static final int REQ_PICK_IMAGES = 1002;
     private static final int REQ_CREATE = 1003;
 
-    private ImageView imageView;
+    private ZoomImageView imageView;
     private TextView titleView;
     private TextView infoView;
     private Button prevBtn, nextBtn, exportBtn;
@@ -67,8 +67,7 @@ public class MainActivity extends Activity {
         root.addView(titleView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        imageView = new ImageView(this);
-        imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        imageView = new ZoomImageView(this);
         imageView.setBackgroundColor(Color.BLACK);
         LinearLayout.LayoutParams imgLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
@@ -224,9 +223,9 @@ public class MainActivity extends Activity {
                     MifWriter.ImageInput ii = new MifWriter.ImageInput();
                     ii.name = queryName(u);
                     ii.originalSize = bytes.length;
-                    if (bytes[0] == (byte) 0xFF && bytes[1] == (byte) 0xD8) {
-                        ii.jpegBytes = bytes; // JPEG 存原文
-                        Logger.d("FUSE", ii.name + ": JPEG 存原文 " + human(bytes.length));
+                    if (MifWriter.isPassthrough(bytes)) {
+                        ii.fileBytes = bytes; // JPEG/WebP/HEIC/AVIF 存原文
+                        Logger.d("FUSE", ii.name + ": 有损格式存原文 " + human(bytes.length));
                     } else {
                         Bitmap bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
                         if (bmp == null) {

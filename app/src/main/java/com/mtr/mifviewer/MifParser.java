@@ -12,35 +12,56 @@ import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 import org.tukaani.xz.XZInputStream;
 
 /**
- * .imgf 文件解析器（imgfuse.py 的输出格式）。
+ * .imgf 文件解析器（imgfuse.py 的输出格式），v1.1 分块。
  * 纯 Java、无 Android 依赖，可在普通 JVM 上单测。
  *
  * 格式:
- *   magic 4B "IMGF"（旧文件 "MIF1" 仍兼容） | codec 1B (0=zlib 1=bz2 2=lzma) | flags 1B
- *   n 4B | mlen 4B | manifest JSON | 压缩数据块
- * manifest: [{name,w,h,kind,offset,size}]  kind="raw"(滤波RGB24) 或 "file"(原文件字节)
+ *   magic 4B "IMGF"（旧文件 "MIF1" 仍兼容） | codec 1B (0=zlib 1=bz2 2=lzma)
+ *   flags 1B (bit0=行滤波, bit1=分块) | n 4B | mlen 4B
+ *   [分块时] cnum 4B + 每块 8B(csize, usize)
+ *   manifest JSON | 压缩数据（分块时为各块拼接）
+ * manifest: [{name,w,h,kind,chunk,offset,size}]
+ *
+ * v1.1 关键改进：查看任意一张图只解压其所在的块（~8MB），
+ * 不再全量解压整个 blob。
  */
 public class MifParser {
+
+    public static final int FLAG_FILTERED = 1;
+    public static final int FLAG_CHUNKED = 2;
+
+    public static class ChunkInfo {
+        public int coff;   // 在压缩 blob 中的偏移
+        public int csize;  // 压缩后大小
+        public int usize;  // 解压后大小
+    }
 
     public static class Entry {
         public String name;
         public int w, h;
         public String kind;      // "raw" 或 "file"
-        public int offset, size; // 在解压后 blob 中的位置
+        public int chunk;        // 所在块索引（v1.0 文件为 0）
+        public int offset, size; // 在解压后块数据中的位置
     }
 
     public static class Bundle {
         public final List<Entry> entries = new ArrayList<>();
-        public byte[] blob;
+        private byte[] compressed;          // 全部压缩数据（各块拼接）
+        private List<ChunkInfo> chunks;     // null 表示 v1.0 单块
+        private int codec;
+        // 只缓存最近解压的一块
+        private int cachedChunk = -1;
+        private byte[] cachedData;
 
-        /** 按需解码第 i 张图。raw 返回 ARGB int[]；file 返回原文件字节。 */
-        public Decoded decode(int i) throws IOException {
+        /** 按需解码第 i 张图：只解压其所在的块。raw 返回 ARGB int[]；file 返回原文件字节。 */
+        public synchronized Decoded decode(int i) throws IOException {
             Entry e = entries.get(i);
-            if (e.offset < 0 || e.size < 0 || e.offset + e.size > blob.length) {
+            byte[] raw = chunkData(e.chunk);
+            if (e.offset < 0 || e.size < 0 || e.offset + e.size > raw.length) {
                 throw new IOException("manifest offset 越界: " + e.name);
             }
             byte[] seg = new byte[e.size];
-            System.arraycopy(blob, e.offset, seg, 0, e.size);
+            System.arraycopy(raw, e.offset, seg, 0, e.size);
             Decoded d = new Decoded();
             d.name = e.name;
             d.w = e.w;
@@ -52,12 +73,35 @@ public class MifParser {
             }
             return d;
         }
+
+        /** 解压第 idx 块（带缓存）。 */
+        private synchronized byte[] chunkData(int idx) throws IOException {
+            if (idx == cachedChunk && cachedData != null) return cachedData;
+            byte[] seg;
+            if (chunks == null) {
+                seg = compressed;
+            } else {
+                ChunkInfo ci = chunks.get(idx);
+                if (ci.coff < 0 || ci.csize < 0 || ci.coff + ci.csize > compressed.length) {
+                    throw new IOException("块表越界");
+                }
+                seg = new byte[ci.csize];
+                System.arraycopy(compressed, ci.coff, seg, 0, ci.csize);
+            }
+            byte[] raw = decompress(seg, codec);
+            cachedChunk = idx;
+            cachedData = raw;
+            return raw;
+        }
+
+        public boolean isChunked() { return chunks != null; }
+        public int chunkCount() { return chunks == null ? 1 : chunks.size(); }
     }
 
     public static class Decoded {
         public String name;
         public int w, h;
-        public byte[] fileBytes; // kind=file (JPEG 原文)
+        public byte[] fileBytes; // kind=file（JPEG/WebP/HEIC 原文）
         public int[] argb;       // kind=raw
     }
 
@@ -69,17 +113,44 @@ public class MifParser {
             throw new IOException("不是 .imgf 文件 (magic 不匹配)");
         }
         int codec = hdr[4] & 0xFF;
+        int flags = hdr[5] & 0xFF;
         int n = u32(hdr, 6);
         int mlen = u32(hdr, 10);
         if (n < 0 || n > 100000 || mlen < 0 || mlen > 64 * 1024 * 1024) {
             throw new IOException("manifest 头异常");
         }
+        boolean chunked = (flags & FLAG_CHUNKED) != 0;
+        if (chunked && isOld) {
+            throw new IOException("旧格式文件不应有分块标志");
+        }
+
+        List<ChunkInfo> chunks = null;
+        if (chunked) {
+            int cnum = u32(readFully(in, 4), 0);
+            if (cnum <= 0 || cnum > 100000) throw new IOException("块数异常");
+            chunks = new ArrayList<>(cnum);
+            byte[] ct = readFully(in, cnum * 8);
+            int coff = 0;
+            for (int i = 0; i < cnum; i++) {
+                ChunkInfo ci = new ChunkInfo();
+                ci.csize = u32(ct, i * 8);
+                ci.usize = u32(ct, i * 8 + 4);
+                ci.coff = coff;
+                if (ci.csize < 0 || ci.usize < 0 || ci.usize > 512 * 1024 * 1024) {
+                    throw new IOException("块大小异常");
+                }
+                chunks.add(ci);
+                coff += ci.csize;
+            }
+        }
+
         String manifest = new String(readFully(in, mlen), "UTF-8");
-        byte[] compressed = readAll(in);
-        byte[] blob = decompress(compressed, codec);
+        byte[] compressed = readAll(in); // 只读，不解压
 
         Bundle b = new Bundle();
-        b.blob = blob;
+        b.compressed = compressed;
+        b.chunks = chunks;
+        b.codec = codec;
         for (Entry e : parseManifest(manifest)) {
             b.entries.add(e);
         }
@@ -184,6 +255,7 @@ public class MifParser {
                     case "kind": e.kind = p.string(); break;
                     case "w": e.w = p.number(); break;
                     case "h": e.h = p.number(); break;
+                    case "chunk": e.chunk = p.number(); break;
                     case "offset": e.offset = p.number(); break;
                     case "size": e.size = p.number(); break;
                     default: p.skipValue(); break;

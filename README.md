@@ -18,7 +18,7 @@ Unlike steganography tools, nothing is hidden inside another image: `.imgf` is a
 ## Features
 
 - **Fuse** — pick multiple images, choose a codec (lzma / bz2 / zlib), save as `.imgf`
-- **View** — tap any `.imgf` in your file manager to open it directly; swipe through images
+- **View** — tap any `.imgf` in your file manager to open it directly; swipe through images, pinch to zoom
 - **Export** — save all bundled images back to your gallery (JPEGs restored byte-for-byte)
 - **In-app log** — built-in log viewer with crash capture (no `adb` needed)
 - **Zero-account, offline** — everything runs on-device
@@ -36,7 +36,9 @@ blob      compressed payload
 ```
 
 - `kind: "raw"` — PNG/BMP/GIF decoded to RGB24, PNG-filtered per row (best of None/Sub/Up/Average/Paeth), concatenated
-- `kind: "file"` — JPEG stored as original bytes (re-encoding a JPEG losslessly only makes it bigger)
+- `kind: "file"` — JPEG/WebP/HEIC/AVIF stored as original bytes (re-encoding a lossy format only makes it bigger; detected by magic bytes, not extension)
+
+Since v1.1, data is split into **chunks** (~8 MiB each, compressed independently), so viewing any image only decompresses its chunk instead of the whole bundle.
 
 Full spec: [docs/FORMAT.md](docs/FORMAT.md). Reference implementation in pure-Python (zero dependencies): [tools/imgfuse.py](tools/imgfuse.py).
 

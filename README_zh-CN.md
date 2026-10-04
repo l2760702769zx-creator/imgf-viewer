@@ -18,7 +18,7 @@
 ## 功能
 
 - **融合** — 多选图片，选压缩编码（lzma / bz2 / zlib），存成 `.imgf`
-- **查看** — 在文件管理器里点 `.imgf` 直接打开，前后翻页浏览
+- **查看** — 在文件管理器里点 `.imgf` 直接打开，前后翻页浏览，双指缩放
 - **导出** — 一键把包里所有图存回相册（JPEG 按原字节还原）
 - **日志** — 内置日志查看器 + 崩溃捕获，不用接 `adb`
 - **离线** — 全本地运行，无账号
@@ -36,7 +36,9 @@ blob      压缩后的数据块
 ```
 
 - `kind: "raw"` — PNG/BMP/GIF 解码成 RGB24，逐行 PNG 滤波（None/Sub/Up/Average/Paeth 取最优），拼起来
-- `kind: "file"` — JPEG 存原字节（JPEG 本来就是有损压缩，解码再无损存只会更大）
+- `kind: "file"` — JPEG/WebP/HEIC/AVIF 存原字节（有损格式解码再无损存只会更大；按魔数识别，不看扩展名）
+
+v1.1 起数据按**块**（chunk，每块约 8MB，独立压缩）存放，查看任意一张图只需解压其所在的块，不用全量解压。
 
 完整规范：[docs/FORMAT.md](docs/FORMAT.md)。纯 Python 零依赖参考实现：[tools/imgfuse.py](tools/imgfuse.py)。
 

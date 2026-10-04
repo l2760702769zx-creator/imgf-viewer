@@ -1,6 +1,6 @@
 # `.imgf` Format Specification
 
-Version 1.0. All multi-byte integers are big-endian.
+Version 1.1. All multi-byte integers are big-endian.
 
 ## Overview
 
@@ -21,12 +21,37 @@ offset  size  field
               Legacy files use "MIF1" — readers MUST accept both.
 4       1     codec: 0 = zlib, 1 = bzip2, 2 = lzma (XZ)
 5       1     flags: bit 0 = rows are PNG-filtered (always 1 when written
-              by current tools); other bits reserved, MUST be 0
+              by current tools); bit 1 = chunked (v1.1+);
+              other bits reserved, MUST be 0
 6       4     n: number of images (uint32)
 10      4     mlen: manifest JSON byte length (uint32)
-14      mlen  manifest: UTF-8 JSON array (see below)
-14+mlen ...   blob: compressed payload (codec above)
+14      4*    cnum: chunk count (uint32), present only if chunked
+18      8*    per chunk: csize (uint32), usize (uint32),
+              repeated cnum times, present only if chunked
+...     mlen  manifest: UTF-8 JSON array (see below)
+...     ...   blob: if chunked, concatenation of cnum independently
+              compressed chunks (in order); else one compressed stream
 ```
+
+### Chunking (v1.1)
+
+v1.0 stored the whole bundle as one solid compressed stream, so viewing any
+single image required decompressing everything — fatal for large bundles on
+mobile. v1.1 splits the decompressed data into **chunks** (writers SHOULD seal
+a chunk at ~8 MiB decompressed or 64 images, whichever comes first) and
+compresses each chunk independently.
+
+- The chunk table (`cnum`, then `csize`/`usize` pairs) lets readers locate each
+  compressed chunk without decompressing the others.
+- Each manifest entry carries a `chunk` index; its `offset`/`size` are relative
+  to that chunk's **decompressed** data.
+- Readers MUST cache decompressed chunks (at least the most recent) instead of
+  re-decompressing per image.
+- Readers that do not understand chunking MUST refuse with a clear error
+  ("chunked .imgf requires a v1.1+ reader") instead of mis-decoding.
+- v1.1 readers MUST still read unchunked v1.0 files (bit 1 clear, no chunk
+  table, entries have no `chunk` field → chunk 0, offsets relative to the
+  single blob).
 
 ## Manifest
 
@@ -46,8 +71,9 @@ A JSON array with exactly `n` objects, in bundle order:
 | name   | string | original file name (informational) |
 | w, h   | int    | image dimensions; `0` when `kind` is `"file"` |
 | kind   | string | `"raw"` or `"file"` |
-| offset | int    | byte offset into the **decompressed** blob |
-| size   | int    | byte length of this entry in the decompressed blob |
+| chunk  | int    | chunk index (v1.1 chunked files only; 0 when unchunked) |
+| offset | int    | byte offset into the **decompressed chunk** |
+| size   | int    | byte length of this entry in the decompressed chunk |
 
 `offset`/`size` are arbitrary-precision JSON numbers; readers MUST bounds-check
 them against the decompressed blob length.
@@ -75,9 +101,16 @@ Typical source: PNG, BMP, GIF decoded to RGB24.
 
 ### `kind: "file"`
 
-The entry holds the original file bytes verbatim (e.g. a JPEG). This is used
-for formats where decoding + lossless re-encoding would only grow the data —
-JPEG being the prime example, since it is already lossy-compressed.
+The entry holds the original file bytes verbatim. This is used for formats
+where decoding + lossless re-encoding would only grow the data — i.e. all
+common **lossy** formats:
+
+- JPEG (`FF D8`)
+- WebP (`RIFF....WEBP`)
+- HEIC/HEIF (`....ftyp` + brand `heic`/`heix`/`hevc`/`heim`/`mif1`/`msf1`)
+- AVIF (`....ftyp` + brand `avif`/`avis`)
+
+Writers MUST detect these by magic bytes, not by file extension.
 
 ## Compression notes
 
